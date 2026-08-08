@@ -3,7 +3,9 @@ import unittest
 import torch
 
 from transattack.data import adjacency_from_edge_index, edge_index_from_adjacency, make_sbm, undirected_pairs
+from transattack.dshield_aug import augmented_graph_views, stable_view_seed, view_statistics
 from transattack.gps_attack import adaptive_gps_attack, candidate_additions
+from transattack.heuristic_search import heuristic_candidates, heuristic_remote_search
 from transattack.gps_model import (
     GraphGPSNodeClassifier,
     candidate_trace_views_for_adjacencies,
@@ -29,6 +31,21 @@ class Phase3Tests(unittest.TestCase):
             dropout=0.0,
         ).eval()
         cls.adjacency = adjacency_from_edge_index(cls.graph.edge_index, cls.graph.num_nodes).float()
+
+    def test_dshield_views_are_deterministic_symmetric_subgraphs(self):
+        seed = stable_view_seed("phase6-test")
+        left_adj, left_x = augmented_graph_views(self.graph, self.adjacency, 4, 0.2, 0.2, seed)
+        right_adj, right_x = augmented_graph_views(self.graph, self.adjacency, 4, 0.2, 0.2, seed)
+        self.assertTrue(torch.equal(left_adj, right_adj))
+        self.assertTrue(torch.equal(left_x, right_x))
+        self.assertTrue(torch.equal(left_adj, left_adj.transpose(1, 2)))
+        self.assertTrue(torch.all(left_adj <= self.adjacency.unsqueeze(0)))
+
+    def test_dshield_disagreement_is_zero_for_identical_views(self):
+        logits = torch.tensor([[[2.0, 0.0], [0.0, 2.0]]]).repeat(5, 1, 1)
+        stats = view_statistics(logits, target=0, true_label=0)
+        self.assertEqual(stats.prediction, 0)
+        self.assertAlmostEqual(stats.disagreement, 0.0, places=12)
 
     def test_rwse_shape_and_structural_sensitivity(self):
         pe = rwse_from_adjacency(self.adjacency, 4)
@@ -119,6 +136,79 @@ class Phase3Tests(unittest.TestCase):
             self.assertNotIn(target, (u, v))
             self.assertEqual(float(self.adjacency[u, v]), 0.0)
             self.assertTrue(float(self.adjacency[target, u]) > 0 or float(self.adjacency[target, v]) > 0)
+
+    def test_multi_rival_candidates_preserve_remote_threat_model(self):
+        trace = evaluate_gps_trace(self.model, self.graph, self.graph.edge_index, torch.device("cpu"))
+        target = int(self.graph.test_idx[0])
+        candidates = heuristic_candidates(
+            self.graph,
+            self.adjacency,
+            trace.logits,
+            target,
+            pool_size=20,
+            strategy="multi_rival",
+        )
+        self.assertTrue(candidates)
+        self.assertEqual(len(candidates), len(set(candidates)))
+        for u, v in candidates:
+            self.assertNotIn(target, (u, v))
+            self.assertEqual(float(self.adjacency[u, v]), 0.0)
+            self.assertTrue(float(self.adjacency[target, u]) > 0 or float(self.adjacency[target, v]) > 0)
+
+    def test_greedy_cross_entropy_search_matches_legacy_first_step(self):
+        clean_trace = evaluate_gps_trace(self.model, self.graph, self.graph.edge_index, torch.device("cpu"))
+        target = int(self.graph.test_idx[0])
+        legacy = adaptive_gps_attack(
+            self.model,
+            self.graph,
+            clean_trace,
+            target,
+            [1],
+            12,
+            "remote",
+            torch.device("cpu"),
+            12,
+        )
+        searched = heuristic_remote_search(
+            self.model,
+            self.graph,
+            clean_trace,
+            target,
+            [1],
+            "cross_entropy",
+            1,
+            "single_rival",
+            "fixed",
+            12,
+            12,
+            torch.device("cpu"),
+            12,
+        )
+        self.assertEqual(legacy[1].added_edges, searched.exact[1].added_edges)
+        self.assertAlmostEqual(legacy[1].margin, searched.exact[1].margin, places=5)
+
+    def test_within_budget_search_is_monotone_in_canonical_attack_score(self):
+        clean_trace = evaluate_gps_trace(self.model, self.graph, self.graph.edge_index, torch.device("cpu"))
+        searched = heuristic_remote_search(
+            self.model,
+            self.graph,
+            clean_trace,
+            int(self.graph.test_idx[0]),
+            [1, 2, 3],
+            "normalized_margin",
+            2,
+            "multi_rival",
+            "adaptive",
+            8,
+            16,
+            torch.device("cpu"),
+            16,
+        )
+        scores = [searched.within_budget[budget].attack_score for budget in (1, 2, 3)]
+        self.assertEqual(scores, sorted(scores))
+        for budget, snapshot in searched.within_budget.items():
+            self.assertLessEqual(snapshot.used_edges, budget)
+            self.assertTrue(torch.isfinite(torch.tensor(snapshot.objective_score)))
 
     def test_zero_strength_adaptive_attack_matches_classification_attack(self):
         clean_trace = evaluate_gps_trace(self.model, self.graph, self.graph.edge_index, torch.device("cpu"))

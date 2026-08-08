@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from transattack.attack import adaptive_addition_attack, select_attack_targets
-from transattack.data import adjacency_from_edge_index, count_edges, make_sbm, undirected_pairs
+from transattack.data import PLANETOID_NAMES, adjacency_from_edge_index, count_edges, make_sbm, undirected_pairs
 from transattack.localize import (
     GaussianProfile,
     edge_features,
@@ -17,6 +17,9 @@ from transattack.phase2 import _round_robin, candidate_rankings
 
 
 class Phase0Tests(unittest.TestCase):
+    def test_pubmed_is_a_supported_planetoid_dataset(self):
+        self.assertEqual(PLANETOID_NAMES["pubmed"], "PubMed")
+
     @classmethod
     def setUpClass(cls):
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

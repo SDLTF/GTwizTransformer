@@ -10,6 +10,13 @@ from scipy.sparse.csgraph import connected_components
 from torch import Tensor
 
 
+PLANETOID_NAMES = {
+    "cora": "Cora",
+    "citeseer": "CiteSeer",
+    "pubmed": "PubMed",
+}
+
+
 @dataclass(frozen=True)
 class GraphData:
     name: str
@@ -203,13 +210,12 @@ def load_graph(name: str, root: Path, max_nodes: int, seed: int) -> GraphData:
     normalized = name.lower().strip()
     if normalized in {"sbm", "toy", "synthetic"}:
         return make_sbm(max_nodes, seed)
-    if normalized not in {"cora", "citeseer"}:
+    if normalized not in PLANETOID_NAMES:
         raise ValueError(f"unsupported dataset: {name}")
     from torch_geometric.datasets import Planetoid
     from torch_geometric.utils import to_undirected
 
-    canonical = "Cora" if normalized == "cora" else "CiteSeer"
+    canonical = PLANETOID_NAMES[normalized]
     item = Planetoid(root=str(root / "Planetoid"), name=canonical)[0]
     edges = to_undirected(item.edge_index.cpu(), num_nodes=item.num_nodes)
     return _induced(canonical, item.x.cpu(), item.y.cpu(), edges, max_nodes, seed)
-

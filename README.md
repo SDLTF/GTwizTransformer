@@ -106,3 +106,12 @@ holdout at `rho=0.95` is documented in
 retains 99.35% attack progress while slightly reducing AUPRC and Recall@B; it
 does not reduce causal repair. This holdout does not replace the still-unrun
 formal experiment at the development-selected `rho=0.50`.
+
+Phase 6 tests transfer to locally cached PubMed and an explicitly named
+`DShield-Aug` test-time adaptation. See `docs/PHASE6_PROTOCOL.md` and
+`docs/PHASE6_FINDINGS.md`. The attack is underpowered on PubMed: only eight
+successful clusters occur in two of five seeds. DShield-Aug and edge-only
+augmentation recover all observed successes but make identical predictions on
+all snapshots and do not pass the frozen clean-utility confidence threshold.
+The result motivates a stronger PubMed attack and defense-adaptive evaluation,
+not a claim that official DShield defends this GraphGPS threat.
