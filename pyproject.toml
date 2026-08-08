@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graph-trans-attack"
+version = "0.1.0"
+description = "Layer-wise graph-transformer dynamics for adversarial subgraph localization"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "scipy>=1.11",
+  "torch>=2.1",
+  "torch-geometric>=2.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["transattack*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
