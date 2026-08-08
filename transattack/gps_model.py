@@ -186,14 +186,24 @@ class GraphGPSNodeClassifier(nn.Module):
         logits = self._classify(hidden)
         if not return_trace:
             return logits
-        if int(batch.max().item()) != 0:
-            raise ValueError("trace mode currently requires exactly one graph")
-        return ModelTrace(
-            logits=logits,
-            attentions=torch.stack([item.squeeze(0) for item in attentions], dim=0),
-            values=torch.stack([item.squeeze(0) for item in values], dim=0),
-            hidden=torch.stack(hidden_states, dim=0),
-            layer_logits=torch.stack([self._classify(item) for item in hidden_states], dim=0),
+        graph_count = int(batch.max().item()) + 1
+        nodes = logits.size(0) // graph_count
+        if graph_count == 1:
+            return ModelTrace(
+                logits=logits,
+                attentions=torch.stack([item.squeeze(0) for item in attentions], dim=0),
+                values=torch.stack([item.squeeze(0) for item in values], dim=0),
+                hidden=torch.stack(hidden_states, dim=0),
+                layer_logits=torch.stack([self._classify(item) for item in hidden_states], dim=0),
+            )
+        hidden_batch = torch.stack(hidden_states, dim=1).reshape(graph_count, nodes, len(hidden_states), self.channels)
+        layer_logits = torch.stack([self._classify(item) for item in hidden_states], dim=1)
+        return GPSBatchTrace(
+            logits=logits.reshape(graph_count, nodes, -1),
+            attentions=torch.stack(attentions, dim=1),
+            values=torch.stack(values, dim=1),
+            hidden=hidden_batch.permute(0, 2, 1, 3).contiguous(),
+            layer_logits=layer_logits.reshape(graph_count, nodes, len(hidden_states), -1).permute(0, 2, 1, 3).contiguous(),
         )
 
 
@@ -213,6 +223,22 @@ class BatchTelemetry:
     maximum_graphs_per_forward: int = 0
     graphs: int = 0
     forwards: int = 0
+
+
+@dataclass(frozen=True)
+class GPSBatchTrace:
+    logits: Tensor
+    attentions: Tensor
+    values: Tensor
+    hidden: Tensor
+    layer_logits: Tensor
+
+
+@dataclass(frozen=True)
+class CandidateTraceViews:
+    logits: Tensor
+    all_layer_full: Tensor
+    temporal_residual: Tensor
 
 
 def _single_inputs(graph: GraphData, edge_index: Tensor, walk_length: int, device: torch.device):
@@ -353,3 +379,142 @@ def logits_for_adjacencies(
             if telemetry is not None:
                 telemetry.minimum_resolved_batch_size = min(telemetry.minimum_resolved_batch_size, resolved)
     return torch.cat(outputs, dim=0)
+
+
+def _endpoint(values: Tensor, nodes: Tensor) -> Tensor:
+    index = nodes[:, None, None].expand(-1, values.size(1), 1)
+    return torch.gather(values, 2, index).squeeze(2)
+
+
+def _candidate_edge_views(trace: GPSBatchTrace, candidates: list[tuple[int, int]]) -> tuple[Tensor, Tensor]:
+    """Extract the Phase-3 edge views for one designated edge per graph."""
+    device = trace.logits.device
+    graph_ids = torch.arange(len(candidates), device=device)
+    u = torch.tensor([pair[0] for pair in candidates], device=device, dtype=torch.long)
+    v = torch.tensor([pair[1] for pair in candidates], device=device, dtype=torch.long)
+    attention = trace.attentions.float()
+    layers, heads, nodes = attention.size(1), attention.size(2), attention.size(3)
+    a_uv = attention[graph_ids, :, :, u, v]
+    a_vu = attention[graph_ids, :, :, v, u]
+    symmetric_attention = 0.5 * (a_uv + a_vu).mean(-1)
+
+    probability = attention.clamp_min(1e-12)
+    entropy = -(probability * probability.log()).sum(-1) / max(float(torch.log(torch.tensor(float(nodes)))), 1.0)
+    entropy = entropy.mean(2)
+    endpoint_entropy = 0.5 * (_endpoint(entropy, u) + _endpoint(entropy, v))
+
+    js = torch.zeros_like(entropy)
+    if layers > 1:
+        left = probability[:, 1:]
+        right = probability[:, :-1]
+        mixture = 0.5 * (left + right)
+        layer_js = 0.5 * (
+            (left * (left.log() - mixture.log())).sum(-1)
+            + (right * (right.log() - mixture.log())).sum(-1)
+        ).mean(2)
+        js[:, 1:] = layer_js
+    endpoint_js = 0.5 * (_endpoint(js, u) + _endpoint(js, v))
+
+    value_norm = trace.values.float().norm(dim=-1)
+    value_u = torch.gather(value_norm, 2, u[:, None, None, None].expand(-1, layers, 1, heads)).squeeze(2)
+    value_v = torch.gather(value_norm, 2, v[:, None, None, None].expand(-1, layers, 1, heads)).squeeze(2)
+    contribution = 0.5 * (a_uv * value_v + a_vu * value_u).mean(-1)
+
+    hidden_delta = (trace.hidden[:, 1:] - trace.hidden[:, :-1]).float().norm(dim=-1)
+    endpoint_hidden_delta = 0.5 * (_endpoint(hidden_delta, u) + _endpoint(hidden_delta, v))
+
+    layer_probability = torch.softmax(trace.layer_logits.float(), dim=-1)
+    probability_delta = 0.5 * (layer_probability[:, 1:] - layer_probability[:, :-1]).abs().sum(-1)
+    endpoint_probability_delta = 0.5 * (_endpoint(probability_delta, u) + _endpoint(probability_delta, v))
+
+    normalized_hidden = F.normalize(trace.hidden[:, 1:].float(), dim=-1)
+    hidden_u = torch.gather(
+        normalized_hidden,
+        2,
+        u[:, None, None, None].expand(-1, layers, 1, normalized_hidden.size(-1)),
+    ).squeeze(2)
+    hidden_v = torch.gather(
+        normalized_hidden,
+        2,
+        v[:, None, None, None].expand(-1, layers, 1, normalized_hidden.size(-1)),
+    ).squeeze(2)
+    hidden_cosine = (hidden_u * hidden_v).sum(-1)
+
+    per_layer = torch.stack(
+        (
+            symmetric_attention,
+            endpoint_entropy,
+            endpoint_js,
+            contribution,
+            endpoint_hidden_delta,
+            endpoint_probability_delta,
+            hidden_cosine,
+        ),
+        dim=-1,
+    )
+    temporal = per_layer[:, 1:] - per_layer[:, :-1]
+    return per_layer.flatten(1).double(), temporal.flatten(1).double()
+
+
+@torch.no_grad()
+def candidate_trace_views_for_adjacencies(
+    model: GraphGPSNodeClassifier,
+    graph: GraphData,
+    adjacencies: Tensor,
+    candidates: list[tuple[int, int]],
+    device: torch.device,
+    batch_size: int,
+    telemetry: BatchTelemetry | None = None,
+) -> CandidateTraceViews:
+    """Evaluate variants in batches and retain only each candidate edge's trace views."""
+    if adjacencies.ndim != 3 or len(candidates) != adjacencies.size(0):
+        raise ValueError("one candidate edge is required for every adjacency")
+    model.eval()
+    logits_output: list[Tensor] = []
+    all_output: list[Tensor] = []
+    temporal_output: list[Tensor] = []
+    cursor = 0
+    resolved = max(1, int(batch_size))
+    if telemetry is not None:
+        telemetry.requested_batch_size = int(batch_size)
+        telemetry.minimum_resolved_batch_size = min(telemetry.minimum_resolved_batch_size, int(batch_size))
+    while cursor < adjacencies.size(0):
+        size = min(resolved, adjacencies.size(0) - cursor)
+        try:
+            adjacency = adjacencies[cursor : cursor + size].to(device=device, dtype=torch.float32)
+            count, nodes = adjacency.size(0), adjacency.size(1)
+            pe = rwse_from_adjacency(adjacency, model.walk_length).reshape(count * nodes, model.walk_length)
+            edge_index = batched_edge_index(adjacency)
+            x = graph.x.to(device).unsqueeze(0).expand(count, -1, -1).reshape(count * nodes, graph.num_features)
+            batch = torch.arange(count, device=device).repeat_interleave(nodes)
+            trace = model(x, pe, edge_index, batch, return_trace=True)
+            if isinstance(trace, ModelTrace):
+                trace = GPSBatchTrace(
+                    logits=trace.logits.unsqueeze(0),
+                    attentions=trace.attentions.unsqueeze(0),
+                    values=trace.values.unsqueeze(0),
+                    hidden=trace.hidden.unsqueeze(0),
+                    layer_logits=trace.layer_logits.unsqueeze(0),
+                )
+            all_view, temporal_view = _candidate_edge_views(trace, candidates[cursor : cursor + count])
+            logits_output.append(trace.logits.detach().cpu())
+            all_output.append(all_view.detach().cpu())
+            temporal_output.append(temporal_view.detach().cpu())
+            cursor += count
+            if telemetry is not None:
+                telemetry.graphs += count
+                telemetry.forwards += 1
+                telemetry.maximum_graphs_per_forward = max(telemetry.maximum_graphs_per_forward, count)
+        except torch.cuda.OutOfMemoryError:
+            if device.type != "cuda" or size == 1:
+                raise
+            adjacency = None
+            torch.cuda.empty_cache()
+            resolved = max(1, size // 2)
+            if telemetry is not None:
+                telemetry.minimum_resolved_batch_size = min(telemetry.minimum_resolved_batch_size, resolved)
+    return CandidateTraceViews(
+        logits=torch.cat(logits_output),
+        all_layer_full=torch.cat(all_output),
+        temporal_residual=torch.cat(temporal_output),
+    )

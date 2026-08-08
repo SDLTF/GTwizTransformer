@@ -87,3 +87,22 @@ passes the frozen viability, dynamics-fingerprint, and label-free causal
 localization criteria on 20 successful remote model-target clusters. The
 effect is not uniform across dataset-seed slices, so the documented conclusion
 is deliberately limited to this GraphGPS architecture and two-hop attacker.
+
+Phase 4 stress-tests that detector with a white-box adaptive attacker that
+jointly penalizes all-layer anomaly, temporal residual anomaly, and predicted-
+class counterfactual signal. See `docs/PHASE4_PROTOCOL.md` and
+`docs/PHASE4_FINDINGS.md`. The fresh paired run is underpowered at 11 joint
+clusters: adaptive AUPRC and candidate coverage decrease, but Top-B recall and
+repair do not. Invalid preliminary execution directories are explicitly
+excluded in `docs/PHASE4_INVALID_RUN.md`.
+
+Phase 5 replaces the equal-weight tradeoff with a classification-constrained
+stealth objective: at each attack step it minimizes trajectory/causal evidence
+only among edges retaining at least `rho` of the best positive classification
+gain. See `docs/PHASE5_PROTOCOL.md`. A separate user-directed fresh-seed
+holdout at `rho=0.95` is documented in
+`docs/PHASE5_R095_HOLDOUT_PROTOCOL.md` and
+`docs/PHASE5_R095_HOLDOUT_FINDINGS.md`. Across 53 joint-success clusters it
+retains 99.35% attack progress while slightly reducing AUPRC and Recall@B; it
+does not reduce causal repair. This holdout does not replace the still-unrun
+formal experiment at the development-selected `rho=0.50`.

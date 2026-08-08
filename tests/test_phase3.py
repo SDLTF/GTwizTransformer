@@ -2,9 +2,16 @@ import unittest
 
 import torch
 
-from transattack.data import adjacency_from_edge_index, edge_index_from_adjacency, make_sbm
-from transattack.gps_attack import candidate_additions
-from transattack.gps_model import GraphGPSNodeClassifier, evaluate_gps_trace, logits_for_adjacencies, rwse_from_adjacency
+from transattack.data import adjacency_from_edge_index, edge_index_from_adjacency, make_sbm, undirected_pairs
+from transattack.gps_attack import adaptive_gps_attack, candidate_additions
+from transattack.gps_model import (
+    GraphGPSNodeClassifier,
+    candidate_trace_views_for_adjacencies,
+    evaluate_gps_trace,
+    logits_for_adjacencies,
+    rwse_from_adjacency,
+)
+from transattack.localize import edge_features, feature_views, fit_view_profiles
 
 
 class Phase3Tests(unittest.TestCase):
@@ -64,6 +71,38 @@ class Phase3Tests(unittest.TestCase):
         self.assertTrue(torch.allclose(batched[0], first, atol=1e-6, rtol=1e-5))
         self.assertTrue(torch.allclose(batched[1], second, atol=1e-6, rtol=1e-5))
 
+    def test_batched_candidate_trace_views_match_single_graph_views(self):
+        candidates = candidate_additions(
+            self.graph,
+            self.adjacency,
+            evaluate_gps_trace(self.model, self.graph, self.graph.edge_index, torch.device("cpu")).logits,
+            int(self.graph.test_idx[0]),
+            pool_size=2,
+            attack_type="remote",
+        )
+        variants = self.adjacency.unsqueeze(0).repeat(2, 1, 1)
+        for index, (u, v) in enumerate(candidates):
+            variants[index, u, v] = variants[index, v, u] = 1.0
+        batched = candidate_trace_views_for_adjacencies(
+            self.model,
+            self.graph,
+            variants,
+            candidates,
+            torch.device("cpu"),
+            batch_size=2,
+        )
+        for index, pair in enumerate(candidates):
+            trace = evaluate_gps_trace(
+                self.model,
+                self.graph,
+                edge_index_from_adjacency(variants[index]),
+                torch.device("cpu"),
+            )
+            views = feature_views(edge_features(trace, torch.tensor(pair).reshape(2, 1)))
+            self.assertTrue(torch.allclose(batched.logits[index], trace.logits, atol=1e-6, rtol=1e-5))
+            self.assertTrue(torch.allclose(batched.all_layer_full[index], views["all_layer_full"][0], atol=1e-6, rtol=1e-5))
+            self.assertTrue(torch.allclose(batched.temporal_residual[index], views["temporal_residual"][0], atol=1e-6, rtol=1e-5))
+
     def test_remote_candidates_are_nonincident_and_two_hop(self):
         trace = evaluate_gps_trace(self.model, self.graph, self.graph.edge_index, torch.device("cpu"))
         target = int(self.graph.test_idx[0])
@@ -81,7 +120,86 @@ class Phase3Tests(unittest.TestCase):
             self.assertEqual(float(self.adjacency[u, v]), 0.0)
             self.assertTrue(float(self.adjacency[target, u]) > 0 or float(self.adjacency[target, v]) > 0)
 
+    def test_zero_strength_adaptive_attack_matches_classification_attack(self):
+        clean_trace = evaluate_gps_trace(self.model, self.graph, self.graph.edge_index, torch.device("cpu"))
+        profiles = fit_view_profiles(edge_features(clean_trace, undirected_pairs(self.graph.edge_index)))
+        target = int(self.graph.test_idx[0])
+        baseline = adaptive_gps_attack(
+            self.model,
+            self.graph,
+            clean_trace,
+            target,
+            [1, 2],
+            12,
+            "remote",
+            torch.device("cpu"),
+            12,
+        )
+        adaptive = adaptive_gps_attack(
+            self.model,
+            self.graph,
+            clean_trace,
+            target,
+            [1, 2],
+            12,
+            "remote",
+            torch.device("cpu"),
+            12,
+            attack_objective="adaptive_stealth",
+            profiles=profiles,
+            adaptive_stealth_strength=0.0,
+        )
+        self.assertEqual(baseline[2].added_edges, adaptive[2].added_edges)
+
+    def test_unit_retention_constrained_attack_matches_classification_attack(self):
+        clean_trace = evaluate_gps_trace(self.model, self.graph, self.graph.edge_index, torch.device("cpu"))
+        profiles = fit_view_profiles(edge_features(clean_trace, undirected_pairs(self.graph.edge_index)))
+        target = int(self.graph.test_idx[0])
+        baseline = adaptive_gps_attack(
+            self.model,
+            self.graph,
+            clean_trace,
+            target,
+            [1, 2],
+            12,
+            "remote",
+            torch.device("cpu"),
+            12,
+        )
+        constrained = adaptive_gps_attack(
+            self.model,
+            self.graph,
+            clean_trace,
+            target,
+            [1, 2],
+            12,
+            "remote",
+            torch.device("cpu"),
+            12,
+            attack_objective="classification_constrained_stealth",
+            profiles=profiles,
+            classification_retention_ratio=1.0,
+        )
+        self.assertEqual(baseline[2].added_edges, constrained[2].added_edges)
+        self.assertEqual(constrained[2].minimum_selected_gain_ratio, 1.0)
+        self.assertEqual(constrained[2].eligible_candidates, 1)
+
+    def test_constrained_attack_rejects_invalid_retention_ratio(self):
+        clean_trace = evaluate_gps_trace(self.model, self.graph, self.graph.edge_index, torch.device("cpu"))
+        with self.assertRaises(ValueError):
+            adaptive_gps_attack(
+                self.model,
+                self.graph,
+                clean_trace,
+                int(self.graph.test_idx[0]),
+                [1],
+                12,
+                "remote",
+                torch.device("cpu"),
+                12,
+                classification_retention_ratio=0.0,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
-

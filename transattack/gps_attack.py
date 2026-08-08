@@ -7,11 +7,22 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .data import GraphData, adjacency_from_edge_index, edge_index_from_adjacency
-from .gps_model import BatchTelemetry, GraphGPSNodeClassifier, logits_for_adjacencies
+from .gps_model import (
+    BatchTelemetry,
+    GraphGPSNodeClassifier,
+    candidate_trace_views_for_adjacencies,
+    logits_for_adjacencies,
+)
+from .localize import GaussianProfile
 from .model import ModelTrace, true_margin
 
 
 ATTACK_TYPES = ("incident", "remote")
+ATTACK_OBJECTIVES = (
+    "classification_only",
+    "adaptive_stealth",
+    "classification_constrained_stealth",
+)
 
 
 @dataclass(frozen=True)
@@ -26,6 +37,10 @@ class GPSAttackSnapshot:
     prediction: int
     margin: float
     success: bool
+    selected_gain_ratio: float = float("nan")
+    minimum_selected_gain_ratio: float = float("nan")
+    eligible_candidates: int = 0
+    mean_eligible_candidates: float = float("nan")
 
 
 def _rival_and_scores(graph: GraphData, logits: Tensor, target: int) -> tuple[int, Tensor, Tensor]:
@@ -97,6 +112,13 @@ def _candidate_adjacencies(adjacency: Tensor, candidates: list[tuple[int, int]])
     return variants
 
 
+def _robust_z(values: Tensor) -> Tensor:
+    values = values.detach().cpu().float()
+    median = values.median()
+    scale = (values - median).abs().median().clamp_min(1e-6)
+    return (values - median) / (1.4826 * scale)
+
+
 @torch.no_grad()
 def adaptive_gps_attack(
     model: GraphGPSNodeClassifier,
@@ -109,14 +131,28 @@ def adaptive_gps_attack(
     device: torch.device,
     graph_batch_size: int,
     telemetry: BatchTelemetry | None = None,
+    attack_objective: str = "classification_only",
+    profiles: dict[str, GaussianProfile] | None = None,
+    adaptive_stealth_strength: float = 1.0,
+    classification_retention_ratio: float = 0.85,
 ) -> dict[int, GPSAttackSnapshot]:
     if attack_type not in ATTACK_TYPES:
         raise ValueError(f"unsupported attack type: {attack_type}")
+    if attack_objective not in ATTACK_OBJECTIVES:
+        raise ValueError(f"unsupported attack objective: {attack_objective}")
+    if adaptive_stealth_strength < 0:
+        raise ValueError("adaptive stealth strength must be nonnegative")
+    if not 0 < classification_retention_ratio <= 1:
+        raise ValueError("classification retention ratio must lie in (0, 1]")
+    if attack_objective != "classification_only" and profiles is None:
+        raise ValueError("stealth-aware attacks require clean trace profiles")
     maximum = max(budgets)
     current_adjacency = adjacency_from_edge_index(graph.edge_index, graph.num_nodes).float()
     current_logits = clean_trace.logits
     target_label = int(graph.y[target])
     added: list[tuple[int, int]] = []
+    selected_gain_ratios: list[float] = []
+    eligible_counts: list[int] = []
     snapshots: dict[int, GPSAttackSnapshot] = {}
     for step in range(1, maximum + 1):
         candidates = candidate_additions(
@@ -130,18 +166,75 @@ def adaptive_gps_attack(
         if not candidates:
             break
         variants = _candidate_adjacencies(current_adjacency, candidates)
-        logits = logits_for_adjacencies(
-            model,
-            graph,
-            variants,
-            device,
-            graph_batch_size,
-            telemetry,
-        )
+        if attack_objective == "classification_only":
+            logits = logits_for_adjacencies(
+                model,
+                graph,
+                variants,
+                device,
+                graph_batch_size,
+                telemetry,
+            )
+            all_scores = temporal_scores = cf_signal = None
+        else:
+            traced = candidate_trace_views_for_adjacencies(
+                model,
+                graph,
+                variants,
+                candidates,
+                device,
+                graph_batch_size,
+                telemetry,
+            )
+            logits = traced.logits
+            assert profiles is not None
+            all_scores = profiles["all_layer_full"].score(traced.all_layer_full)
+            temporal_scores = profiles["temporal_residual"].score(traced.temporal_residual)
         target_logits = logits[:, target, :]
         labels = torch.full((len(candidates),), target_label, dtype=torch.long)
         losses = F.cross_entropy(target_logits, labels, reduction="none")
-        best_index = int(losses.argmax())
+        if attack_objective == "classification_only":
+            selection_scores = losses
+        else:
+            predictions = target_logits.argmax(dim=-1)
+            candidate_probabilities = torch.softmax(target_logits, dim=-1)
+            attacked_probability = candidate_probabilities.gather(1, predictions.unsqueeze(1)).squeeze(1)
+            previous_probability = torch.softmax(current_logits[target].float(), dim=-1)[predictions]
+            cf_signal = (attacked_probability - previous_probability).clamp_min(0.0)
+            assert all_scores is not None and temporal_scores is not None
+            stealth_penalty = (
+                _robust_z(all_scores)
+                + _robust_z(temporal_scores)
+                + _robust_z(cf_signal)
+            ) / 3.0
+            if attack_objective == "adaptive_stealth":
+                selection_scores = _robust_z(losses) - adaptive_stealth_strength * stealth_penalty
+            else:
+                current_row = current_logits[target].float().reshape(1, -1)
+                current_loss = float(F.cross_entropy(current_row, torch.tensor([target_label])))
+                gains = losses - current_loss
+                best_loss_index = int(losses.argmax())
+                best_gain = float(gains[best_loss_index])
+                if classification_retention_ratio == 1.0:
+                    eligible = torch.zeros_like(losses, dtype=torch.bool)
+                    eligible[best_loss_index] = True
+                elif best_gain > 1e-12:
+                    eligible = gains >= classification_retention_ratio * best_gain
+                else:
+                    eligible = torch.zeros_like(losses, dtype=torch.bool)
+                    eligible[best_loss_index] = True
+                eligible_indices = torch.nonzero(eligible, as_tuple=False).flatten()
+                eligible_penalties = stealth_penalty[eligible_indices]
+                minimum_penalty = eligible_penalties.min()
+                tied = eligible_indices[eligible_penalties <= minimum_penalty + 1e-12]
+                best_index = int(tied[losses[tied].argmax()])
+                selected_gain_ratios.append(
+                    float(gains[best_index] / best_gain) if best_gain > 1e-12 else 1.0
+                )
+                eligible_counts.append(int(eligible.sum()))
+                selection_scores = None
+        if attack_objective != "classification_constrained_stealth":
+            best_index = int(selection_scores.argmax())
         best_pair = candidates[best_index]
         current_adjacency = variants[best_index]
         current_logits = logits[best_index]
@@ -160,6 +253,11 @@ def adaptive_gps_attack(
                 prediction=prediction,
                 margin=true_margin(row, target_label),
                 success=prediction != target_label,
+                selected_gain_ratio=(selected_gain_ratios[-1] if selected_gain_ratios else float("nan")),
+                minimum_selected_gain_ratio=(min(selected_gain_ratios) if selected_gain_ratios else float("nan")),
+                eligible_candidates=(eligible_counts[-1] if eligible_counts else 0),
+                mean_eligible_candidates=(
+                    sum(eligible_counts) / len(eligible_counts) if eligible_counts else float("nan")
+                ),
             )
     return snapshots
-

@@ -17,8 +17,8 @@ from torch import Tensor
 
 from .attack import select_attack_targets
 from .data import GraphData, adjacency_from_edge_index, edge_index_from_adjacency, load_graph, undirected_pairs
-from .gps_attack import ATTACK_TYPES, adaptive_gps_attack
-from .gps_model import BatchTelemetry, GraphGPSNodeClassifier, evaluate_gps_trace, logits_for_adjacencies, train_gps_model
+from .gps_attack import ATTACK_OBJECTIVES, ATTACK_TYPES, adaptive_gps_attack
+from .gps_model import BatchTelemetry, GPSTrainResult, GraphGPSNodeClassifier, evaluate_gps_trace, logits_for_adjacencies, train_gps_model
 from .localize import edge_features, feature_views, fit_view_profiles, positive_mask, ranking_metrics, top_pairs
 from .model import true_margin
 from .phase1 import _bootstrap, _format_pairs, _rank_promoted, _robust_z, _safe, _selection_metrics, _table, _write_json
@@ -53,12 +53,16 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=0.002)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--bootstrap-repetitions", type=int, default=5000)
+    parser.add_argument("--attack-objective", choices=ATTACK_OBJECTIVES, default="classification_only")
+    parser.add_argument("--adaptive-stealth-strength", type=float, default=1.0)
+    parser.add_argument("--classification-retention-ratio", type=float, default=0.85)
     parser.add_argument("--minimum-remote-clusters", type=int, default=12)
     parser.add_argument("--minimum-remote-seeds", type=int, default=2)
     parser.add_argument("--minimum-remote-datasets", type=int, default=1)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--strict-cuda", action="store_true")
     parser.add_argument("--data-root", type=Path, default=Path("data"))
+    parser.add_argument("--reference-run-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
@@ -173,6 +177,10 @@ def main() -> int:
         raise ValueError("channels must be divisible by heads")
     if min(args.minimum_remote_clusters, args.minimum_remote_seeds, args.minimum_remote_datasets) < 1:
         raise ValueError("remote viability thresholds must be positive")
+    if args.adaptive_stealth_strength < 0:
+        raise ValueError("adaptive stealth strength must be nonnegative")
+    if not 0 < args.classification_retention_ratio <= 1:
+        raise ValueError("classification retention ratio must lie in (0, 1]")
     if not args.smoke and sorted(set(args.seeds)) != sorted(set(args.expected_seeds)):
         raise ValueError("canonical Phase-3 seeds do not match the frozen holdout seeds")
     device = _device(args.device, args.strict_cuda)
@@ -211,29 +219,95 @@ def main() -> int:
     coverage_rows: list[dict[str, Any]] = []
     metric_rows: list[dict[str, Any]] = []
     candidate_rows: list[dict[str, Any]] = []
+    reference_attacks: pd.DataFrame | None = None
+    reference_dir: Path | None = None
+    if args.reference_run_dir is not None:
+        reference_dir = args.reference_run_dir.resolve()
+        reference_attacks = pd.read_csv(reference_dir / "attack_metrics.csv")
+        reference_config = json.loads((reference_dir / "config.json").read_text(encoding="utf-8"))
+        for key in ("datasets", "seeds", "budgets", "nodes", "targets", "channels", "pe_channels", "walk_length", "layers", "heads", "dropout"):
+            current = config[key]
+            if reference_config[key] != current:
+                raise ValueError(f"reference run configuration mismatch for {key}")
+        print(f"[phase3] loading paired checkpoints and targets from {reference_dir}", flush=True)
 
     for dataset_name in args.datasets:
         for seed in args.seeds:
             model_started = time.perf_counter()
             graph = load_graph(dataset_name, args.data_root.resolve(), args.nodes, int(seed))
-            trained = train_gps_model(
-                graph,
-                device,
-                int(seed),
-                args.channels,
-                args.pe_channels,
-                args.walk_length,
-                args.layers,
-                args.heads,
-                args.dropout,
-                args.epochs,
-                args.patience,
-                args.learning_rate,
-                args.weight_decay,
-            )
+            if reference_dir is None:
+                trained = train_gps_model(
+                    graph,
+                    device,
+                    int(seed),
+                    args.channels,
+                    args.pe_channels,
+                    args.walk_length,
+                    args.layers,
+                    args.heads,
+                    args.dropout,
+                    args.epochs,
+                    args.patience,
+                    args.learning_rate,
+                    args.weight_decay,
+                )
+            else:
+                checkpoint_path = reference_dir / "checkpoints" / f"{graph.name.lower()}_rwse_seed{seed}.pt"
+                checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+                model = GraphGPSNodeClassifier(
+                    graph.num_features,
+                    graph.num_classes,
+                    args.channels,
+                    args.pe_channels,
+                    args.walk_length,
+                    args.layers,
+                    args.heads,
+                    args.dropout,
+                ).to(device)
+                model.load_state_dict(checkpoint["state_dict"])
+                assert reference_attacks is not None
+                reference_slice = reference_attacks[
+                    (reference_attacks.dataset.str.lower() == graph.name.lower())
+                    & (reference_attacks.seed == int(seed))
+                ]
+                if reference_slice.empty:
+                    raise ValueError(f"reference attacks missing for {graph.name}/seed{seed}")
+                trained = GPSTrainResult(
+                    model=model,
+                    best_epoch=int(reference_slice.best_epoch.iloc[0]),
+                    best_val_accuracy=float(reference_slice.best_val_accuracy.iloc[0]),
+                    train_accuracy=float("nan"),
+                    test_accuracy=float(reference_slice.clean_test_accuracy.iloc[0]),
+                )
             model = trained.model
             clean_trace = evaluate_gps_trace(model, graph, graph.edge_index, device)
-            targets = select_attack_targets(clean_trace, graph, args.targets)
+            if reference_attacks is None:
+                targets = select_attack_targets(clean_trace, graph, args.targets)
+            else:
+                reference_slice = reference_attacks[
+                    (reference_attacks.dataset.str.lower() == graph.name.lower())
+                    & (reference_attacks.seed == int(seed))
+                ]
+                targets = reference_slice.drop_duplicates("target").target.astype(int).tolist()
+                if not targets or len(targets) > args.targets:
+                    raise ValueError(f"invalid reference target count for {graph.name}/seed{seed}")
+                reference_margins = reference_slice.groupby("target").clean_margin.first().to_dict()
+                margin_differences: list[float] = []
+                for target in targets:
+                    label = int(graph.y[target])
+                    margin = true_margin(clean_trace.logits[target], label)
+                    difference = abs(margin - float(reference_margins[target]))
+                    margin_differences.append(difference)
+                    if difference > 3e-4:
+                        raise ValueError(
+                            f"reference clean margin mismatch for {graph.name}/seed{seed}/target{target}: "
+                            f"difference={difference:.9g}"
+                        )
+                print(
+                    f"[phase3] reference_margin_max_abs_diff={max(margin_differences):.3g} "
+                    f"for {graph.name}/seed{seed}",
+                    flush=True,
+                )
             clean_pairs = undirected_pairs(graph.edge_index)
             clean_features = edge_features(clean_trace, clean_pairs)
             profiles = fit_view_profiles(clean_features)
@@ -259,6 +333,10 @@ def main() -> int:
                         device,
                         args.graph_batch_size,
                         telemetry,
+                        args.attack_objective,
+                        profiles,
+                        args.adaptive_stealth_strength,
+                        args.classification_retention_ratio,
                     )
                     label = int(graph.y[target])
                     clean_margin = true_margin(clean_trace.logits[target], label)
@@ -275,6 +353,9 @@ def main() -> int:
                             "true_added_edges": _pairs_text(snapshot.added_edges),
                             "clean_margin": clean_margin,
                             "attacked_margin": snapshot.margin,
+                            "attack_objective": args.attack_objective,
+                            "adaptive_stealth_strength": args.adaptive_stealth_strength,
+                            "classification_retention_ratio": args.classification_retention_ratio,
                         }
                         attack_rows.append({
                             **attack_identity,
@@ -284,6 +365,10 @@ def main() -> int:
                             "clean_test_accuracy": trained.test_accuracy,
                             "best_val_accuracy": trained.best_val_accuracy,
                             "best_epoch": trained.best_epoch,
+                            "selected_gain_ratio": snapshot.selected_gain_ratio,
+                            "minimum_selected_gain_ratio": snapshot.minimum_selected_gain_ratio,
+                            "eligible_candidates": snapshot.eligible_candidates,
+                            "mean_eligible_candidates": snapshot.mean_eligible_candidates,
                         })
                         if not snapshot.success:
                             print(f"[phase3] {attack_id} success=False", flush=True)
