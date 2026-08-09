@@ -41,6 +41,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--strict-cuda", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--validation-only", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
 
@@ -211,6 +212,7 @@ def main() -> int:
         comparable_keys = (
             "source_runs", "models", "targets_per_model", "budgets", "candidate_pool",
             "maximum_candidate_pool", "graph_batch_size", "beam_width", "device", "smoke",
+            "validation_only",
         )
         for key in comparable_keys:
             if previous.get(key) != run_config.get(key):
@@ -257,9 +259,15 @@ def main() -> int:
     minimum_batch = args.graph_batch_size
     searches_completed = 0
 
-    executions = list(itertools.product(
-        OBJECTIVES, (1, args.beam_width), CANDIDATE_STRATEGIES, POOL_MODES
-    ))
+    if args.validation_only:
+        executions = [
+            ("cross_entropy", 1, "single_rival", "fixed"),
+            ("normalized_margin", args.beam_width, "multi_rival", "adaptive"),
+        ]
+    else:
+        executions = list(itertools.product(
+            OBJECTIVES, (1, args.beam_width), CANDIDATE_STRATEGIES, POOL_MODES
+        ))
     for dataset, seed in models:
         source = source_index[(dataset, seed)]
         source_config = source_configs[source]
@@ -369,6 +377,8 @@ def main() -> int:
     if unique_searches != expected_searches:
         raise RuntimeError(f"incomplete search grid: {unique_searches}/{expected_searches}")
     summary, decision = _aggregate(results, maximum_budget)
+    if args.validation_only:
+        decision["status"] = "frozen_validation_complete"
     summary.to_csv(output / "configuration_summary.csv", index=False)
     elapsed = time.perf_counter() - started
     gpu = {
